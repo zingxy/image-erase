@@ -2,12 +2,14 @@ interface Point {
   x: number;
   y: number;
 }
+
+const eraserOpacity = 0.8; // 擦除区域的透明度，0-1 之间
 /*
  * world
  *   --camera(logic canvas)
  *       --viewport(css canvas)
  */
-class camera {
+class Camera {
   scene: Scene;
 
   // 世界到相机 p_camera = viewMatrix * world
@@ -99,6 +101,11 @@ class camera {
       .matrixTransform(this.viewportMatrix);
     return viewportPoint;
   }
+  worldToCamera(x: number, y: number): DOMPoint {
+    const point = new DOMPoint(x, y);
+    const cameraPoint = point.matrixTransform(this.viewMatrix);
+    return cameraPoint;
+  }
   viewPortToCamera(x: number, y: number): DOMPoint {
     const invViewport = this.viewportMatrix.inverse();
     const point = new DOMPoint(x, y);
@@ -127,11 +134,33 @@ class Sprite {
   }
 }
 
+class EraseArea {
+  transform: DOMMatrix = new DOMMatrix();
+  radius: number;
+  constructor(x: number, y: number, radius: number) {
+    this.radius = radius;
+    this.transform = new DOMMatrix().translate(x, y);
+  }
+  render(ctx: CanvasRenderingContext2D) {
+    ctx.beginPath();
+    ctx.fillStyle = 'rgba(255,0,0,0.5)';
+    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
 export class Scene {
   canvas: HTMLCanvasElement;
+  maskCanvas: HTMLCanvasElement = document.createElement('canvas');
+  outputCanvas: HTMLCanvasElement = document.createElement('canvas');
+  maskCtx: CanvasRenderingContext2D;
+  outputCtx: CanvasRenderingContext2D;
   ctx: CanvasRenderingContext2D;
-  camera: camera;
+
+  camera: Camera;
   children: Sprite[] = [];
+
+  pressing: boolean = false;
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
@@ -139,12 +168,132 @@ export class Scene {
       throw new Error('Failed to get 2D context');
     }
     this.ctx = ctx;
+    const maskCtx = this.maskCanvas.getContext('2d');
+    if (!maskCtx) {
+      throw new Error('Failed to get 2D context for maskCanvas');
+    }
+    this.maskCtx = maskCtx;
+    const outputCtx = this.outputCanvas.getContext('2d');
+    if (!outputCtx) {
+      throw new Error('Failed to get 2D context for outputCanvas');
+    }
+    this.outputCtx = outputCtx;
+
     this.resize();
-    this.camera = new camera(this);
+    this.camera = new Camera(this);
     this.bindEvents();
   }
 
   bindEvents() {
+    this.canvas.addEventListener('pointerdown', this.onPointerdown);
+    this.canvas.addEventListener('pointermove', this.onPointermove);
+    this.canvas.addEventListener('pointerup', this.onPointerup);
+    this.cursor();
+  }
+
+  onPointerdown = (e: PointerEvent) => {
+    if (e.ctrlKey) return;
+    this.pressing = true;
+  };
+  onPointermove = (e: PointerEvent) => {
+    if (e.ctrlKey) return;
+    if (!this.pressing) return;
+    const eraseSizeInViewport = 20;
+    let eraseSizeInCamera = 20;
+    let eraseSizeInWorld = 20;
+    {
+      const start = this.camera.viewportToWorld(0, 0);
+
+      const end = this.camera.viewportToWorld(eraseSizeInViewport, 0);
+      eraseSizeInWorld = Math.hypot(end.x - start.x, end.y - start.y);
+    }
+    {
+      const start = this.camera.viewPortToCamera(0, 0);
+
+      const end = this.camera.viewPortToCamera(eraseSizeInViewport, 0);
+      eraseSizeInCamera = Math.hypot(end.x - start.x, end.y - start.y);
+    }
+
+    const worldPoint = this.camera.viewportToWorld(e.offsetX, e.offsetY);
+    const eraseArea = new EraseArea(
+      worldPoint.x,
+      worldPoint.y,
+      eraseSizeInWorld
+    );
+
+    const cameraPoint = this.camera.viewPortToCamera(e.offsetX, e.offsetY);
+    this.commitOneToMaskCanvas(cameraPoint, eraseSizeInCamera);
+
+    this.children.push(eraseArea);
+  };
+  onPointerup = (e: PointerEvent) => {
+    this.pressing = false;
+  };
+
+  commitOneToMaskCanvas(cameraPoint: DOMPoint, eraseSizeInCamera: number) {
+    // 在 maskCanvas 上绘制擦除区域
+    this.maskCtx.fillStyle = `rgb(${Math.floor(
+      eraserOpacity * 255
+    )}, ${Math.floor(eraserOpacity * 255)}, ${Math.floor(
+      eraserOpacity * 255
+    )})`;
+    this.maskCtx.beginPath();
+    this.maskCtx.arc(
+      cameraPoint.x,
+      cameraPoint.y,
+      eraseSizeInCamera,
+      0,
+      Math.PI * 2
+    );
+    this.maskCtx.fill();
+    this.composite();
+  }
+  commitAllToMaskCanvas() {
+    this.maskCtx.clearRect(0, 0, this.maskCanvas.width, this.maskCanvas.height);
+    this.children
+      .filter((child) => child instanceof EraseArea)
+      .forEach((child) => {
+        const eraseArea = child as EraseArea;
+        const worldPos = new DOMPoint(0, 0).matrixTransform(
+          eraseArea.transform
+        );
+        const radiusInWorld = eraseArea.radius;
+
+        const centerInCamera = this.camera.worldToCamera(
+          worldPos.x,
+          worldPos.y
+        );
+        const edgeInWorld = new DOMPoint(
+          worldPos.x + radiusInWorld,
+          worldPos.y
+        );
+        const edgeInCamera = this.camera.worldToCamera(
+          edgeInWorld.x,
+          edgeInWorld.y
+        );
+        const radiusInCamera = Math.hypot(
+          edgeInCamera.x - centerInCamera.x,
+          edgeInCamera.y - centerInCamera.y
+        );
+
+        this.maskCtx.fillStyle = `rgb(${Math.floor(
+          eraserOpacity * 255
+        )}, ${Math.floor(eraserOpacity * 255)}, ${Math.floor(
+          eraserOpacity * 255
+        )})`;
+        this.maskCtx.beginPath();
+        this.maskCtx.arc(
+          centerInCamera.x,
+          centerInCamera.y,
+          radiusInCamera,
+          0,
+          Math.PI * 2
+        );
+        this.maskCtx.fill();
+      });
+  }
+
+  cursor() {
     this.canvas.addEventListener('pointermove', (e: PointerEvent) => {
       if (e.ctrlKey) {
         this.canvas.style.cursor = 'grab';
@@ -179,6 +328,12 @@ export class Scene {
     this.canvas.height = Math.floor(rect.height * dpr);
     this.canvas.style.width = `${rect.width}px`;
     this.canvas.style.height = `${rect.height}px`;
+
+    this.maskCanvas.width = this.canvas.width;
+    this.maskCanvas.height = this.canvas.height;
+
+    this.outputCanvas.width = this.canvas.width;
+    this.outputCanvas.height = this.canvas.height;
   }
   canvasCenterInWorld(): DOMPoint {
     const centerX = this.canvas.width / 2;
@@ -211,6 +366,38 @@ export class Scene {
     this.render();
   }
 
+  composite() {
+    const { outputCtx, canvas, ctx, maskCtx } = this;
+
+    const maskData = maskCtx.getImageData(0, 0, canvas.width, canvas.height);
+    const outputData = ctx.createImageData(canvas.width, canvas.height);
+    const originalImageData = ctx.getImageData(
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    for (let i = 0; i < originalImageData.data.length; i += 4) {
+      // 复制 RGB 通道
+      outputData.data[i] = originalImageData.data[i]; // R
+      outputData.data[i + 1] = originalImageData.data[i + 1]; // G
+      outputData.data[i + 2] = originalImageData.data[i + 2]; // B
+
+      // 遮罩值：255 = 未擦除，0 = 完全擦除
+      // maskData.data[i] 是遮罩的 R 通道（灰度值）
+      const maskValue = 1 - maskData.data[i] / 255; // 0~1
+
+      // 新的 alpha = 原始 alpha * 遮罩值
+      // 这样原本透明的像素擦除后会更透明，而不是被覆盖
+      outputData.data[i + 3] = Math.floor(
+        originalImageData.data[i + 3] * maskValue
+      );
+    }
+
+    outputCtx.putImageData(outputData, 0, 0);
+  }
+
   render() {
     const { ctx, canvas } = this;
     ctx.resetTransform();
@@ -218,13 +405,16 @@ export class Scene {
 
     const { a, b, c, d, e, f } = this.camera.viewMatrix;
     ctx.transform(a, b, c, d, e, f);
+    this.commitAllToMaskCanvas();
 
     for (const child of this.children) {
+      if (child instanceof EraseArea) continue;
       const { a, b, c, d, e, f } = child.transform;
       ctx.save();
       ctx.transform(a, b, c, d, e, f);
       child.render(ctx);
       ctx.restore();
     }
+    this.composite();
   }
 }
